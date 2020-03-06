@@ -37,6 +37,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/leaderelection"
+	knative "knative.dev/serving/pkg/apis/networking/v1alpha1"
+	knativeClientSet "knative.dev/serving/pkg/client/clientset/versioned"
 
 	"github.com/kong/kubernetes-ingress-controller/internal/ingress/task"
 	"github.com/kong/kubernetes-ingress-controller/internal/ingress/utils"
@@ -58,12 +60,14 @@ type ingressLister interface {
 	// ListIngresses returns the list of Ingresses
 	ListIngresses() []*networking.Ingress
 	ListTCPIngresses() ([]*configurationv1beta1.TCPIngress, error)
+	ListKnativeIngresses() ([]*knative.Ingress, error)
 }
 
 // Config ...
 type Config struct {
 	CoreClient       clientset.Interface
 	KongConfigClient configurationClientSet.Interface
+	KnativeClient    knativeClientSet.Interface
 
 	OnStartedLeading func()
 
@@ -303,11 +307,17 @@ func sliceToStatus(endpoints []string) []apiv1.LoadBalancerIngress {
 
 // updateStatus changes the status information of Ingress rules
 func (s *statusSync) updateStatus(newIngressPoint []apiv1.LoadBalancerIngress) {
+	glog.Errorf("runnign updateStatus")
 	ings := s.IngressLister.ListIngresses()
 	tcpIngresses, err := s.IngressLister.ListTCPIngresses()
 	if err != nil {
-		glog.Errorf("error listing TPCIngresses for status update")
+		glog.Errorf("error listing TPCIngresses for status update: %v", err)
 	}
+	knativeIngresses, err := s.IngressLister.ListKnativeIngresses()
+	if err != nil {
+		glog.Errorf("error listing Knative Ingress for status update: %v", err)
+	}
+	glog.Error("len of knative Ingress is ", len(knativeIngresses))
 
 	p := pool.NewLimited(10)
 	defer p.Close()
@@ -319,6 +329,9 @@ func (s *statusSync) updateStatus(newIngressPoint []apiv1.LoadBalancerIngress) {
 	}
 	for _, ing := range tcpIngresses {
 		batch.Queue(s.runUpdateTCPIngress(ing, newIngressPoint, s.KongConfigClient))
+	}
+	for _, ing := range knativeIngresses {
+		batch.Queue(s.runUpdateKnativeIngress(ing, newIngressPoint, s.KnativeClient))
 	}
 
 	batch.QueueComplete()
@@ -370,6 +383,76 @@ func (s *statusSync) runUpdate(ing *networking.Ingress, status []apiv1.LoadBalan
 			if err != nil {
 				glog.Warningf("error updating ingress rule: %v", err)
 			}
+		}
+		return true, nil
+	}
+}
+
+func toCoreLBStatus(knativeLBStatus *knative.LoadBalancerStatus) []apiv1.LoadBalancerIngress {
+	var res []apiv1.LoadBalancerIngress
+	if knativeLBStatus == nil {
+		return res
+	}
+	for _, status := range knativeLBStatus.Ingress {
+		res = append(res, apiv1.LoadBalancerIngress{
+			IP:       status.IP,
+			Hostname: status.Domain,
+		})
+	}
+	return res
+}
+
+func toKnativeLBStatus(coreLBStatus []apiv1.LoadBalancerIngress) []knative.LoadBalancerIngressStatus {
+	var res []knative.LoadBalancerIngressStatus
+	for _, status := range coreLBStatus {
+		res = append(res, knative.LoadBalancerIngressStatus{
+			IP:     status.IP,
+			Domain: status.Hostname,
+		})
+	}
+	return res
+}
+
+func (s *statusSync) runUpdateKnativeIngress(ing *knative.Ingress,
+	status []apiv1.LoadBalancerIngress,
+	client knativeClientSet.Interface) pool.WorkFunc {
+	return func(wu pool.WorkUnit) (interface{}, error) {
+		glog.Errorf("this is executed")
+		if wu.IsCancelled() {
+			return nil, nil
+		}
+		glog.Errorf("this is executed 2")
+
+		sort.SliceStable(status, lessLoadBalancerIngress(status))
+
+		glog.Errorf("this is executed 2aa")
+		curIPs := toCoreLBStatus(ing.Status.PublicLoadBalancer)
+		glog.Errorf("this is executed 2ab")
+		sort.SliceStable(curIPs, lessLoadBalancerIngress(curIPs))
+		glog.Errorf("this is executed 2ac")
+
+		glog.Errorf("this is executed 2a")
+		if ingressSliceEqual(status, curIPs) {
+			glog.Errorf("this is executed 2a")
+			glog.Errorf("skipping update of Knative %v/%v (no change)", ing.Namespace, ing.Name)
+			return true, nil
+		}
+		glog.Errorf("this is executed 3")
+
+		ingClient := client.NetworkingV1alpha1().Ingresses(ing.Namespace)
+
+		currIng, err := ingClient.Get(ing.Name, metav1.GetOptions{})
+		if err != nil {
+			return nil, errors.Wrap(err, fmt.Sprintf("unexpected error searching Knative %v/%v", ing.Namespace, ing.Name))
+		}
+
+		glog.Infof("updating Knative %v/%v status to %v", currIng.Namespace, currIng.Name, status)
+		currIng.Status.PublicLoadBalancer = &knative.LoadBalancerStatus{Ingress: toKnativeLBStatus(status)}
+		// TODO knative is going to deprecate this
+		currIng.Status.LoadBalancer = &knative.LoadBalancerStatus{Ingress: toKnativeLBStatus(status)}
+		_, err = ingClient.UpdateStatus(currIng)
+		if err != nil {
+			glog.Warningf("error updating status of TCPIngress: %v", err)
 		}
 		return true, nil
 	}
